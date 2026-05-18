@@ -1,0 +1,19 @@
+# 忽略下载的视频文件和临时切片文件
+*.mp4
+*.ts
+
+# 忽略批处理下载任务的文本文件（取消注释可生效）
+# *.txt
+
+# Python 缓存和虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# IDE 配置文件和系统缓存
+.vscode/
+.idea/
+.DS_Store

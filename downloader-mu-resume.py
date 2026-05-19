@@ -4,10 +4,9 @@ import os
 import time
 import re
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 import shutil
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from Crypto.Cipher import AES
 
 
@@ -37,46 +36,63 @@ class JableDownloader:
         })
         self.start_time = None
         self.total_video_duration_downloaded = 0
-        self.lock = None # ThreadPoolExecutor's map preserves order, so we don't strictly need a lock for file writing
+        self.lock = threading.Lock()
 
     def download_segment(self, seg_info):
-        idx, seg_url, duration, key, key_info, media_sequence = seg_info
-        
+        idx, seg_url, duration, key, key_info, media_sequence, output_path = seg_info
+
+        # 恢复下载检查：如果切片文件已存在且不为空，则跳过
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            with self.lock:
+                self.total_video_duration_downloaded += duration
+            return idx, True
+
         # 全局限速检查：如果当前下载速度超过了设定倍速，则休眠
         while True:
             elapsed = time.time() - self.start_time
             if elapsed <= 0:
                 break
-            current_rate = self.total_video_duration_downloaded / elapsed
+            with self.lock:
+                current_rate = self.total_video_duration_downloaded / elapsed
             if current_rate > self.factor:
                 time.sleep(0.1)
             else:
                 break
 
-        try:
-            # 下载切片
-            res = self.session.get(seg_url, timeout=20)
-            res.raise_for_status()
-            data = res.content
-            
-            # 解密
-            if key:
-                iv = key_info.iv
-                if not iv:
-                    # 使用序列号作为 IV
-                    iv = (media_sequence + idx).to_bytes(16, byteorder='big')
-                elif isinstance(iv, str) and iv.startswith('0x'):
-                    iv = bytes.fromhex(iv[2:])
-                
-                cipher = AES.new(key, AES.MODE_CBC, iv=iv)
-                data = cipher.decrypt(data)
-            
-            # 更新已下载的视频时长（用于限速计算）
-            self.total_video_duration_downloaded += duration
-            return idx, data
-        except Exception as e:
-            print(f"\n切片 {idx} 下载失败: {e}")
-            return idx, None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # 下载切片
+                res = self.session.get(seg_url, timeout=20)
+                res.raise_for_status()
+                data = res.content
+
+                # 解密
+                if key:
+                    iv = key_info.iv
+                    if not iv:
+                        # 使用序列号作为 IV
+                        iv = (media_sequence + idx).to_bytes(16, byteorder='big')
+                    elif isinstance(iv, str) and iv.startswith('0x'):
+                        iv = bytes.fromhex(iv[2:])
+
+                    cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+                    data = cipher.decrypt(data)
+
+                with open(output_path, 'wb') as f:
+                    f.write(data)
+
+                with self.lock:
+                    self.total_video_duration_downloaded += duration
+                return idx, True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"\n切片 {idx} 下载超时或失败: {e}，正在重试 ({attempt + 1}/{max_retries})...")
+                    time.sleep(2)  # 等待 2 秒后重试
+                else:
+                    print(f"\n切片 {idx} 彻底下载失败: {e}")
+                    return idx, False
+        return idx, False
 
     def run(self):
         print(f"正在解析页面: {self.url}")
@@ -110,35 +126,50 @@ class JableDownloader:
         ts_name = f"{slug}.ts"
         mp4_name = f"{slug}.mp4"
         
+        temp_dir = f"{slug}_temp"
+        os.makedirs(temp_dir, exist_ok=True)
+
         print(f"开始多线程限速下载 (目标倍速: {self.factor}x)...")
+        print(f"临时文件将保存在: {temp_dir}")
         self.start_time = time.time()
         
-
         # 准备任务列表
         media_sequence = m3u8_obj.media_sequence or 0
         tasks = []
         for i, seg in enumerate(segments):
             seg_url = seg.absolute_uri
-            tasks.append((i, seg_url, seg.duration, key, key_info, media_sequence))
+            output_path = os.path.join(temp_dir, f"{i}.ts")
+            tasks.append((i, seg_url, seg.duration, key, key_info, media_sequence, output_path))
 
-        # 使用线程池并发下载
-        # executor.map 会保持输入列表的顺序返回结果
+        failed_segments = []
         try:
-            with open(ts_name, 'wb') as f:
-                # 建议使用 5-10 个线程，足以抵消网络延迟并达到 2x 限速
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    for idx, data in executor.map(self.download_segment, tasks):
-                        if data:
-                            f.write(data)
-                        
-                        # 打印进度和实时倍速
-                        percent = (idx + 1) / len(segments) * 100
-                        elapsed = time.time() - self.start_time
-                        real_time_factor = self.total_video_duration_downloaded / elapsed if elapsed > 0 else 0
-                        print(f"进度: {percent:6.2f}% | 切片 {idx+1}/{len(segments)} | 实时倍速: {real_time_factor:.2f}x", end='\r')
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                # executor.map 会保持输入列表的顺序返回结果
+                for idx, success in executor.map(self.download_segment, tasks):
+                    if not success:
+                        failed_segments.append(idx)
 
-            print(f"\n下载完成！共处理 {len(segments)} 个切片。")
-            
+                    # 打印进度和实时倍速
+                    percent = (idx + 1) / len(segments) * 100
+                    elapsed = time.time() - self.start_time
+                    with self.lock:
+                        real_time_factor = self.total_video_duration_downloaded / elapsed if elapsed > 0 else 0
+                    print(f"进度: {percent:6.2f}% | 切片 {idx+1}/{len(segments)} | 实时倍速: {real_time_factor:.2f}x", end='\r')
+
+            if failed_segments:
+                print(f"\n\n下载未完成。有 {len(failed_segments)} 个切片下载失败。")
+                print(f"失败的切片编号: {sorted(failed_segments)}")
+                print(f"临时文件已保存在 {temp_dir}，请重新运行此命令以继续下载。")
+                return
+
+            print(f"\n\n所有切片下载完成！正在合并文件...")
+            with open(ts_name, 'wb') as f_out:
+                for i in range(len(segments)):
+                    segment_path = os.path.join(temp_dir, f"{i}.ts")
+                    with open(segment_path, 'rb') as f_in:
+                        f_out.write(f_in.read())
+            print(f"合并完成: {ts_name}")
+
             # 调用 FFmpeg 转换为 MP4
             print("正在转换为 MP4 格式...")
             try:
@@ -148,6 +179,8 @@ class JableDownloader:
                 if result.returncode == 0:
                     print(f"转换成功: {mp4_name}")
                     os.remove(ts_name)
+                    print(f"正在清理临时文件: {temp_dir}")
+                    shutil.rmtree(temp_dir)
                 else:
                     print(f"\nFFmpeg 转换失败: {result.stderr.decode()}")
                     print(f"中间文件已保留: {ts_name}")
@@ -156,15 +189,14 @@ class JableDownloader:
                 print(f"当前已保存为: {ts_name}")
 
         except KeyboardInterrupt:
-            print("\n下载已由用户中断。")
-            raise
+            print("\n\n下载已由用户中断。临时文件已保留，可重新运行命令继续。")
         except Exception as e:
             print(f"\n运行出错: {e}")
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("用法: python3 downloader-mu.py <视频落地页URL1> [URL2] ... 或 <urls.txt>")
+        print("用法: python3 downloader-mu-resume.py <视频落地页URL1> [URL2] ... 或 <urls.txt>")
     else:
         urls = []
         # 1. 批量输入：支持命令行传入多个 URL，或者直接传入一个包含 URL 列表的 .txt 文件

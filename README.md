@@ -44,6 +44,11 @@ pip install requests m3u8 pycryptodome
 python3 downloader-mu.py <视频落地页URL1> [视频落地页URL2] ...
 ```
 
+```bash
+python3 downloader-mu-resume.py <视频落地页URL1> [视频落地页URL2] ...
+```
+# 这个文件包含：切片自动重试机制、断点续传、临时文件合并等
+
 ### 2. 批量下载（通过 txt 文本文件）
 对于大量的下载需求，建议将所有想要下载的视频 URL 保存到一个 `.txt` 文件中，每行一个链接（空行或以 `#` 开头的行会被自动忽略作为注释处理）。
 

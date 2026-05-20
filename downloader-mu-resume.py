@@ -10,18 +10,70 @@ from concurrent.futures import ThreadPoolExecutor
 from Crypto.Cipher import AES
 
 
-def get_m3u8_url(page_url):
+def get_m3u8_url(page_url, session=None):
+    # 如果传入的直接就是 m3u8 或 mp4 链接，则直接返回
+    if '.m3u8' in page_url or '.mp4' in page_url:
+        return page_url
+
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+        'Referer': page_url
     }
+    if not session:
+        session = requests.Session()
+        
     try:
-        res = requests.get(page_url, headers=headers, timeout=10)
-        match = re.search(r"var hlsUrl = '(.*?)';", res.text)
+        res = session.get(page_url, headers=headers, timeout=10)
+        text = res.text
+
+        # 1. 尝试查找常用的 hlsUrl 变量
+        match = re.search(r"var hlsUrl\s*=\s*['\"](.*?)['\"];", text)
         if match:
             return match.group(1)
-        # Fallback to general m3u8 search
-        match = re.search(r"https://[^\"']+\.m3u8", res.text)
-        return match.group(0) if match else None
+            
+        # 2. 尝试查找 player 初始化的 source 变量 (m3u8/mp4)
+        match = re.search(r"source\s*:\s*['\"](.*?)['\"]", text)
+        if match and ('.m3u8' in match.group(1) or '.mp4' in match.group(1)):
+            return match.group(1).replace('\\/', '/')
+            
+        # 3. 尝试查找 <source src="...m3u8/mp4">
+        match = re.search(r"<source[^>]+src=['\"]([^'\"]+\.(?:m3u8|mp4)[^'\"]*)['\"]", text)
+        if match:
+            return match.group(1).replace('\\/', '/')
+
+        # 4. 遍历所有 iframe 查找嵌套的播放器（放宽匹配条件）
+        iframe_matches = re.findall(r"<iframe[^>]+src=['\"]([^'\"]+)['\"]", text)
+        for embed_url in iframe_matches:
+            if any(x in embed_url for x in ['ads', 'banner', 'pop']): continue
+            
+            if embed_url.startswith('//'):
+                embed_url = 'https:' + embed_url
+            elif embed_url.startswith('/'):
+                from urllib.parse import urlparse
+                parsed = urlparse(page_url)
+                embed_url = f"{parsed.scheme}://{parsed.netloc}{embed_url}"
+            elif not embed_url.startswith('http'):
+                continue
+                
+            try:
+                embed_res = session.get(embed_url, headers=headers, timeout=10)
+                embed_text = embed_res.text
+                
+                # 在 iframe 源码中查找 m3u8 或 mp4
+                match = re.search(r"source\s*:\s*['\"](.*?)['\"]", embed_text)
+                if match and ('.m3u8' in match.group(1) or '.mp4' in match.group(1)):
+                    return match.group(1).replace('\\/', '/')
+                    
+                match = re.search(r"['\"](https?://[^'\"]+\.(?:m3u8|mp4)[^'\"]*)['\"]", embed_text)
+                if match:
+                    return match.group(1).replace('\\/', '/')
+            except:
+                continue
+
+        # 5. 终极 Fallback: 全局正则匹配任何 http(s) 开头且包含 .m3u8 或 .mp4 的链接
+        match = re.search(r"https?://[^\"']+\.(?:m3u8|mp4)[^\"']*", text)
+        return match.group(0).replace('\\/', '/') if match else None
+
     except Exception as e:
         print(f"解析页面失败: {e}")
         return None
@@ -32,7 +84,8 @@ class JableDownloader:
         self.factor = factor
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+            'Referer': self.url
         })
         self.start_time = None
         self.total_video_duration_downloaded = 0
@@ -94,11 +147,89 @@ class JableDownloader:
                     return idx, False
         return idx, False
 
+    def download_direct_mp4(self, url, title_slug):
+        mp4_name = f"{title_slug}.mp4"
+        print(f"\n检测到直接的 MP4 链接，采用流式断点续传下载: {url}")
+        
+        headers = self.session.headers.copy()
+        downloaded_size = 0
+        if os.path.exists(mp4_name):
+            downloaded_size = os.path.getsize(mp4_name)
+            headers['Range'] = f'bytes={downloaded_size}-'
+            print(f"发现已存在的文件 {mp4_name}，已下载 {downloaded_size / (1024*1024):.2f} MB，正在尝试断点续传...")
+
+        try:
+            with self.session.get(url, headers=headers, stream=True, timeout=15) as res:
+                res.raise_for_status()
+                
+                total_size = int(res.headers.get('content-length', 0))
+                if res.status_code == 206: # 服务器支持断点续传 (Partial Content)
+                    total_size += downloaded_size
+                elif res.status_code == 200: # 服务器不支持断点续传，从头开始
+                    downloaded_size = 0
+                else:
+                    print(f"服务器返回异常状态码: {res.status_code}")
+                    return
+
+                print(f"总文件大小预计: {total_size / (1024*1024):.2f} MB")
+                
+                mode = 'ab' if downloaded_size > 0 else 'wb'
+                with open(mp4_name, mode) as f:
+                    start_time = time.time()
+                    current_size = downloaded_size
+                    for chunk in res.iter_content(chunk_size=1024*1024):
+                        if chunk:
+                            f.write(chunk)
+                            current_size += len(chunk)
+                            
+                            if total_size > 0:
+                                percent = current_size / total_size * 100
+                                elapsed = time.time() - start_time
+                                speed = (current_size - downloaded_size) / elapsed / (1024*1024) if elapsed > 0 else 0
+                                print(f"进度: {percent:6.2f}% | 已下载: {current_size/(1024*1024):.2f}MB/{total_size/(1024*1024):.2f}MB | 速度: {speed:.2f} MB/s", end='\r')
+                            else:
+                                print(f"已下载: {current_size/(1024*1024):.2f} MB", end='\r')
+                                
+            print(f"\n\n🎉 MP4 文件下载完成: {mp4_name}")
+        except Exception as e:
+            print(f"\n\n❌ MP4 下载出错: {e}")
+            print(f"临时文件已保留，可重新运行相同命令继续下载。")
+
     def run(self):
-        print(f"正在解析页面: {self.url}")
-        m3u8_url = get_m3u8_url(self.url)
+        print(f"正在解析/请求: {self.url}")
+        
+        # 尝试提取网页标题作为下载后的文件名，解决乱码数字问题
+        title_slug = self.url.split('?')[0].strip('/').split('/')[-1]
+        title_slug = re.sub(r'\.(m3u8|mp4).*$', '', title_slug) # 若直传 m3u8/mp4 则去掉后缀
+
+        if not ('.m3u8' in self.url or '.mp4' in self.url):
+            try:
+                res = self.session.get(self.url, timeout=10)
+                match = re.search(r"<title>(.*?)</title>", res.text, re.IGNORECASE)
+                if match:
+                    raw_title = match.group(1).strip()
+                    # 过滤操作系统的非法文件名字符
+                    clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title)
+                    if clean_title:
+                        title_slug = clean_title
+            except:
+                pass
+
+        m3u8_url = get_m3u8_url(self.url, self.session)
         if not m3u8_url:
-            print("未找到 m3u8 地址，请检查 URL 是否正确。")
+            print("\n❌ 未能自动解析出 m3u8 或 mp4 视频地址！")
+            print("【原因分析】:")
+            print("有些网站（如 avjoy）必须在页面上“点击播放按钮”后，才会通过前端 JS 动态向服务器请求真实的视频地址。这种情况下 Python 脚本无法自动获取。")
+            print("\n【💡 终极解决办法】:")
+            print("1. 在浏览器打开此视频页面，按 F12 键打开“开发者工具”，切换到 Network (网络) 面板。")
+            print("2. 点击网页上的播放按钮，然后在 Network 面板的过滤框中输入 m3u8 或 mp4。")
+            print("3. 找到并复制抓包出来的那个真实的视频链接。")
+            print("4. 直接将该链接传给本脚本执行：")
+            print(f"   python3 downloader-mu-resume.py \"https://.../video.mp4\"")
+            return
+            
+        if '.mp4' in m3u8_url and not '.m3u8' in m3u8_url:
+            self.download_direct_mp4(m3u8_url, title_slug)
             return
 
         res = self.session.get(m3u8_url)
@@ -122,11 +253,10 @@ class JableDownloader:
             key = self.session.get(key_url).content
             print("检测到加密流，已获取解密密钥。")
 
-        slug = self.url.strip('/').split('/')[-1]
-        ts_name = f"{slug}.ts"
-        mp4_name = f"{slug}.mp4"
+        ts_name = f"{title_slug}.ts"
+        mp4_name = f"{title_slug}.mp4"
         
-        temp_dir = f"{slug}_temp"
+        temp_dir = f"{title_slug}_temp"
         os.makedirs(temp_dir, exist_ok=True)
 
         print(f"开始多线程限速下载 (目标倍速: {self.factor}x)...")
